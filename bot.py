@@ -1,0 +1,439 @@
+import asyncio
+import json
+import logging
+import os
+import sqlite3
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+JST = ZoneInfo("Asia/Tokyo")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "attendance.db")
+AUDIT_CHANNEL_ID = int(os.getenv("AUDIT_CHANNEL_ID", "0"))
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("attendance-bot")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def format_datetime(value: str | None) -> str:
+    if not value:
+        return "未打刻"
+    return datetime.fromisoformat(value).astimezone(JST).strftime("%Y-%m-%d %H:%M")
+
+
+def parse_jst_datetime(value: str, field_name: str) -> str | None:
+    value = value.strip()
+    if not value or value == "-":
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+    except ValueError as exc:
+        raise ValueError(f"{field_name}は `YYYY-MM-DD HH:MM` 形式で入力してください。") from exc
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+class AttendanceDatabase:
+    def __init__(self, path: str) -> None:
+        self.connection = sqlite3.connect(path)
+        self.connection.row_factory = sqlite3.Row
+        self.lock = asyncio.Lock()
+        self._create_tables()
+
+    def _create_tables(self) -> None:
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS work_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                clock_in TEXT NOT NULL,
+                clock_out TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS attendance_audits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                session_id INTEGER NOT NULL,
+                editor_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                before_json TEXT,
+                after_json TEXT,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_user
+                ON work_sessions(guild_id, user_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_audits_session
+                ON attendance_audits(guild_id, session_id, id DESC);
+            """
+        )
+        self.connection.commit()
+
+    async def clock_in(self, guild_id: int, user_id: int) -> sqlite3.Row:
+        async with self.lock:
+            open_session = self.connection.execute(
+                """
+                SELECT * FROM work_sessions
+                WHERE guild_id = ? AND user_id = ? AND clock_out IS NULL
+                ORDER BY id DESC LIMIT 1
+                """,
+                (guild_id, user_id),
+            ).fetchone()
+            if open_session:
+                raise ValueError(f"すでに出勤済みです。記録ID: `{open_session['id']}`")
+
+            now = utc_now()
+            cursor = self.connection.execute(
+                """
+                INSERT INTO work_sessions(guild_id, user_id, clock_in, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (guild_id, user_id, now, now, now),
+            )
+            self.connection.commit()
+            return self.get_session(cursor.lastrowid)
+
+    async def clock_out(self, guild_id: int, user_id: int) -> sqlite3.Row:
+        async with self.lock:
+            session = self.connection.execute(
+                """
+                SELECT * FROM work_sessions
+                WHERE guild_id = ? AND user_id = ? AND clock_out IS NULL
+                ORDER BY id DESC LIMIT 1
+                """,
+                (guild_id, user_id),
+            ).fetchone()
+            if not session:
+                raise ValueError("出勤中の記録がありません。")
+
+            now = utc_now()
+            self.connection.execute(
+                "UPDATE work_sessions SET clock_out = ?, updated_at = ? WHERE id = ?",
+                (now, now, session["id"]),
+            )
+            self.connection.commit()
+            return self.get_session(session["id"])
+
+    def get_session(self, session_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM work_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+
+    def latest_session(self, guild_id: int, user_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            """
+            SELECT * FROM work_sessions
+            WHERE guild_id = ? AND user_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+
+    def list_sessions(self, guild_id: int, user_id: int, limit: int = 10) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """
+            SELECT s.*,
+                   EXISTS(
+                       SELECT 1 FROM attendance_audits a
+                       WHERE a.session_id = s.id AND a.guild_id = s.guild_id
+                   ) AS corrected
+            FROM work_sessions s
+            WHERE s.guild_id = ? AND s.user_id = ?
+            ORDER BY s.id DESC LIMIT ?
+            """,
+            (guild_id, user_id, limit),
+        ).fetchall()
+
+    def list_audits(self, guild_id: int, user_id: int, limit: int = 10) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """
+            SELECT a.* FROM attendance_audits a
+            INNER JOIN work_sessions s ON s.id = a.session_id
+            WHERE a.guild_id = ? AND s.user_id = ?
+            ORDER BY a.id DESC LIMIT ?
+            """,
+            (guild_id, user_id, limit),
+        ).fetchall()
+
+    async def correct_session(
+        self,
+        guild_id: int,
+        owner_id: int,
+        editor_id: int,
+        session_id: int,
+        clock_in: str,
+        clock_out: str | None,
+        reason: str,
+    ) -> tuple[sqlite3.Row, sqlite3.Row]:
+        async with self.lock:
+            session = self.get_session(session_id)
+            if not session or session["guild_id"] != guild_id or session["user_id"] != owner_id:
+                raise ValueError("対象の勤怠記録が見つかりません。")
+            if clock_out and datetime.fromisoformat(clock_out) < datetime.fromisoformat(clock_in):
+                raise ValueError("退勤時刻は出勤時刻より後にしてください。")
+            if not clock_out:
+                other_open_session = self.connection.execute(
+                    """
+                    SELECT id FROM work_sessions
+                    WHERE guild_id = ? AND user_id = ? AND clock_out IS NULL AND id != ?
+                    LIMIT 1
+                    """,
+                    (guild_id, owner_id, session_id),
+                ).fetchone()
+                if other_open_session:
+                    raise ValueError(
+                        f"記録ID `{other_open_session['id']}` が出勤中のため、未退勤には変更できません。"
+                    )
+
+            before = dict(session)
+            now = utc_now()
+            self.connection.execute(
+                """
+                UPDATE work_sessions
+                SET clock_in = ?, clock_out = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (clock_in, clock_out, now, session_id),
+            )
+            after = dict(self.get_session(session_id))
+            cursor = self.connection.execute(
+                """
+                INSERT INTO attendance_audits(
+                    guild_id, session_id, editor_id, action,
+                    before_json, after_json, reason, created_at
+                )
+                VALUES (?, ?, ?, 'CORRECT', ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    session_id,
+                    editor_id,
+                    json.dumps(before, ensure_ascii=False),
+                    json.dumps(after, ensure_ascii=False),
+                    reason,
+                    now,
+                ),
+            )
+            self.connection.commit()
+            audit = self.connection.execute(
+                "SELECT * FROM attendance_audits WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+            return self.get_session(session_id), audit
+
+
+db = AttendanceDatabase(DATABASE_PATH)
+
+
+def session_text(session: sqlite3.Row) -> str:
+    return (
+        f"記録ID: `{session['id']}`\n"
+        f"出勤: `{format_datetime(session['clock_in'])}`\n"
+        f"退勤: `{format_datetime(session['clock_out'])}`"
+    )
+
+
+def attendance_embed(message: str | None = None) -> discord.Embed:
+    description = "ボタンから出勤・退勤を記録できます。修正内容は履歴として保存されます。"
+    if message:
+        description = f"{message}\n\n{description}"
+    return discord.Embed(title="勤怠管理", description=description, color=discord.Color.blue())
+
+
+async def send_audit_log(interaction: discord.Interaction, audit: sqlite3.Row) -> None:
+    if not AUDIT_CHANNEL_ID:
+        return
+    channel = interaction.client.get_channel(AUDIT_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        log.warning("AUDIT_CHANNEL_ID does not point to a cached text channel")
+        return
+
+    before = json.loads(audit["before_json"])
+    after = json.loads(audit["after_json"])
+    embed = discord.Embed(title="勤怠記録が修正されました", color=discord.Color.orange())
+    embed.add_field(name="記録ID", value=str(audit["session_id"]))
+    embed.add_field(name="修正者", value=f"<@{audit['editor_id']}>")
+    embed.add_field(
+        name="変更前",
+        value=f"出勤: `{format_datetime(before['clock_in'])}`\n退勤: `{format_datetime(before['clock_out'])}`",
+        inline=False,
+    )
+    embed.add_field(
+        name="変更後",
+        value=f"出勤: `{format_datetime(after['clock_in'])}`\n退勤: `{format_datetime(after['clock_out'])}`",
+        inline=False,
+    )
+    embed.add_field(name="理由", value=audit["reason"], inline=False)
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        log.exception("Failed to send the correction audit message")
+
+
+class CorrectionModal(discord.ui.Modal, title="勤怠記録の修正"):
+    session_id = discord.ui.TextInput(label="記録ID", placeholder="例: 12", max_length=12)
+    clock_in = discord.ui.TextInput(label="出勤時刻", placeholder="YYYY-MM-DD HH:MM")
+    clock_out = discord.ui.TextInput(
+        label="退勤時刻", placeholder="YYYY-MM-DD HH:MM または未打刻なら -", required=False
+    )
+    reason = discord.ui.TextInput(label="修正理由", style=discord.TextStyle.paragraph, max_length=300)
+
+    def __init__(self, session: sqlite3.Row) -> None:
+        super().__init__()
+        self.session_id.default = str(session["id"])
+        self.clock_in.default = format_datetime(session["clock_in"])
+        self.clock_out.default = format_datetime(session["clock_out"]) if session["clock_out"] else "-"
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id
+        try:
+            session_id = int(self.session_id.value)
+            clock_in = parse_jst_datetime(self.clock_in.value, "出勤時刻")
+            clock_out = parse_jst_datetime(self.clock_out.value, "退勤時刻")
+            if not clock_in:
+                raise ValueError("出勤時刻は必須です。")
+            if not self.reason.value.strip():
+                raise ValueError("修正理由は必須です。")
+            session, audit = await db.correct_session(
+                interaction.guild_id,
+                interaction.user.id,
+                interaction.user.id,
+                session_id,
+                clock_in,
+                clock_out,
+                self.reason.value.strip(),
+            )
+            await send_audit_log(interaction, audit)
+            await interaction.response.send_message(
+                embed=attendance_embed(
+                    f"修正しました。修正履歴にも記録済みです。\n{session_text(session)}"
+                ),
+                view=AttendanceView(),
+                ephemeral=True,
+            )
+        except (ValueError, TypeError) as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+
+
+class AttendanceView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="出勤", style=discord.ButtonStyle.success, custom_id="attendance:clock_in")
+    async def clock_in(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        assert interaction.guild_id
+        try:
+            session = await db.clock_in(interaction.guild_id, interaction.user.id)
+            await interaction.response.send_message(
+                embed=attendance_embed(f"出勤を記録しました。\n{session_text(session)}"),
+                view=AttendanceView(),
+                ephemeral=True,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+
+    @discord.ui.button(label="退勤", style=discord.ButtonStyle.danger, custom_id="attendance:clock_out")
+    async def clock_out(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        assert interaction.guild_id
+        try:
+            session = await db.clock_out(interaction.guild_id, interaction.user.id)
+            await interaction.response.send_message(
+                embed=attendance_embed(f"退勤を記録しました。\n{session_text(session)}"),
+                view=AttendanceView(),
+                ephemeral=True,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+
+    @discord.ui.button(label="修正", style=discord.ButtonStyle.secondary, custom_id="attendance:correct")
+    async def correct(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        assert interaction.guild_id
+        session = db.latest_session(interaction.guild_id, interaction.user.id)
+        if not session:
+            await interaction.response.send_message("修正できる勤怠記録がありません。", ephemeral=True)
+            return
+        await interaction.response.send_modal(CorrectionModal(session))
+
+
+class AttendanceBot(commands.Bot):
+    def __init__(self) -> None:
+        intents = discord.Intents.default()
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self) -> None:
+        self.add_view(AttendanceView())
+        await self.tree.sync()
+
+
+bot = AttendanceBot()
+
+
+@bot.tree.command(name="勤怠パネル", description="出勤・退勤・修正ボタンを設置します")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+async def attendance_panel(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(embed=attendance_embed(), view=AttendanceView())
+
+
+@bot.tree.command(name="勤怠一覧", description="自分の直近の勤怠記録を表示します")
+@app_commands.guild_only()
+async def attendance_list(interaction: discord.Interaction) -> None:
+    assert interaction.guild_id
+    sessions = db.list_sessions(interaction.guild_id, interaction.user.id)
+    if not sessions:
+        await interaction.response.send_message("勤怠記録はまだありません。", ephemeral=True)
+        return
+    lines = []
+    for session in sessions:
+        corrected = " 修正済み" if session["corrected"] else ""
+        lines.append(
+            f"`#{session['id']}` {format_datetime(session['clock_in'])} - "
+            f"{format_datetime(session['clock_out'])}{corrected}"
+        )
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="修正履歴", description="自分の直近の勤怠修正履歴を表示します")
+@app_commands.guild_only()
+async def correction_history(interaction: discord.Interaction) -> None:
+    assert interaction.guild_id
+    audits = db.list_audits(interaction.guild_id, interaction.user.id)
+    if not audits:
+        await interaction.response.send_message("修正履歴はありません。", ephemeral=True)
+        return
+    lines = [
+        f"`記録#{audit['session_id']}` {format_datetime(audit['created_at'])} "
+        f"理由: {audit['reason']}"
+        for audit in audits
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@attendance_panel.error
+async def attendance_panel_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "勤怠パネルの設置にはサーバー管理権限が必要です。", ephemeral=True
+        )
+        return
+    raise error
+
+
+token = os.getenv("DISCORD_TOKEN")
+if not token:
+    raise RuntimeError("DISCORD_TOKEN is not configured")
+
+bot.run(token)
