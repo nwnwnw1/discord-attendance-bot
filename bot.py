@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import discord
@@ -43,19 +43,13 @@ def parse_jst_datetime(value: str, field_name: str) -> str | None:
     return parsed.astimezone(timezone.utc).isoformat()
 
 
-def parse_jst_date(value: str | None) -> datetime:
+def parse_jst_month(value: str | None) -> datetime:
     if not value:
-        return datetime.now(JST).replace(hour=0, minute=0, second=0, microsecond=0)
+        return datetime.now(JST).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     try:
-        return datetime.strptime(value.strip(), "%Y-%m-%d").replace(tzinfo=JST)
+        return datetime.strptime(value.strip(), "%Y-%m").replace(tzinfo=JST)
     except ValueError as exc:
-        raise ValueError("日付は `YYYY-MM-DD` 形式で入力してください。") from exc
-
-
-def format_time(value: str | None) -> str:
-    if not value:
-        return "未打刻"
-    return datetime.fromisoformat(value).astimezone(JST).strftime("%H:%M")
+        raise ValueError("月は `YYYY-MM` 形式で入力してください。") from exc
 
 
 class AttendanceDatabase:
@@ -158,7 +152,13 @@ class AttendanceDatabase:
             (guild_id, user_id),
         ).fetchone()
 
-    def list_sessions(self, guild_id: int, user_id: int, limit: int = 10) -> list[sqlite3.Row]:
+    def list_sessions(self, guild_id: int, user_id: int, month_start: datetime) -> list[sqlite3.Row]:
+        if month_start.month == 12:
+            next_month = month_start.replace(year=month_start.year + 1, month=1)
+        else:
+            next_month = month_start.replace(month=month_start.month + 1)
+        start_utc = month_start.astimezone(timezone.utc).isoformat()
+        end_utc = next_month.astimezone(timezone.utc).isoformat()
         return self.connection.execute(
             """
             SELECT s.*,
@@ -167,28 +167,10 @@ class AttendanceDatabase:
                        WHERE a.session_id = s.id AND a.guild_id = s.guild_id
                    ) AS corrected
             FROM work_sessions s
-            WHERE s.guild_id = ? AND s.user_id = ?
-            ORDER BY s.id DESC LIMIT ?
-            """,
-            (guild_id, user_id, limit),
-        ).fetchall()
-
-    def list_sessions_for_date(self, guild_id: int, day_start: datetime) -> list[sqlite3.Row]:
-        day_end = day_start + timedelta(days=1)
-        start_utc = day_start.astimezone(timezone.utc).isoformat()
-        end_utc = day_end.astimezone(timezone.utc).isoformat()
-        return self.connection.execute(
-            """
-            SELECT s.*,
-                   EXISTS(
-                       SELECT 1 FROM attendance_audits a
-                       WHERE a.session_id = s.id AND a.guild_id = s.guild_id
-                   ) AS corrected
-            FROM work_sessions s
-            WHERE s.guild_id = ? AND s.clock_in >= ? AND s.clock_in < ?
+            WHERE s.guild_id = ? AND s.user_id = ? AND s.clock_in >= ? AND s.clock_in < ?
             ORDER BY s.clock_in ASC, s.id ASC
             """,
-            (guild_id, start_utc, end_utc),
+            (guild_id, user_id, start_utc, end_utc),
         ).fetchall()
 
     def list_audits(self, guild_id: int, user_id: int, limit: int = 10) -> list[sqlite3.Row]:
@@ -436,55 +418,34 @@ async def attendance_panel(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=attendance_embed(), view=AttendanceView())
 
 
-@bot.tree.command(name="勤怠一覧", description="自分の直近の勤怠記録を表示します")
+@bot.tree.command(name="勤怠一覧", description="自分の指定月の勤怠記録を表示します")
 @app_commands.guild_only()
-async def attendance_list(interaction: discord.Interaction) -> None:
+@app_commands.describe(月="表示する月。例: 2026-06。未入力なら当月")
+async def attendance_list(interaction: discord.Interaction, 月: str | None = None) -> None:
     assert interaction.guild_id
-    sessions = db.list_sessions(interaction.guild_id, interaction.user.id)
-    if not sessions:
-        await interaction.response.send_message("勤怠記録はまだありません。", ephemeral=True)
+    try:
+        month_start = parse_jst_month(月)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
         return
-    lines = []
+
+    sessions = db.list_sessions(interaction.guild_id, interaction.user.id, month_start)
+    label = month_start.strftime("%Y-%m")
+    if not sessions:
+        await interaction.response.send_message(f"{label} の勤怠記録はありません。", ephemeral=True)
+        return
+    lines = [f"**{label} の勤怠一覧**"]
     for session in sessions:
         corrected = " 修正済み" if session["corrected"] else ""
         lines.append(
             f"`#{session['id']}` {format_datetime(session['clock_in'])} - "
             f"{format_datetime(session['clock_out'])}{corrected}"
         )
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
-
-
-@bot.tree.command(name="勤怠日別", description="指定日の出勤・退勤時刻をチャンネルに一覧表示します")
-@app_commands.guild_only()
-@app_commands.describe(日付="表示する日付。例: 2026-06-03。未入力なら今日")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def attendance_daily(interaction: discord.Interaction, 日付: str | None = None) -> None:
-    assert interaction.guild_id
-    try:
-        day_start = parse_jst_date(日付)
-    except ValueError as exc:
-        await interaction.response.send_message(str(exc), ephemeral=True)
-        return
-
-    sessions = db.list_sessions_for_date(interaction.guild_id, day_start)
-    label = day_start.strftime("%Y-%m-%d")
-    if not sessions:
-        await interaction.response.send_message(f"{label} の勤怠記録はありません。")
-        return
-
-    lines = [f"**{label} の勤怠一覧**"]
-    for session in sessions:
-        corrected = " / 修正済み" if session["corrected"] else ""
-        lines.append(
-            f"`#{session['id']}` <@{session['user_id']}> "
-            f"出勤 `{format_time(session['clock_in'])}` / "
-            f"退勤 `{format_time(session['clock_out'])}`{corrected}"
-        )
 
     chunks = chunk_lines(lines)
-    await interaction.response.send_message(chunks[0])
+    await interaction.response.send_message(chunks[0], ephemeral=True)
     for chunk in chunks[1:]:
-        await interaction.followup.send(chunk)
+        await interaction.followup.send(chunk, ephemeral=True)
 
 
 @bot.tree.command(name="修正履歴", description="自分の直近の勤怠修正履歴を表示します")
@@ -508,16 +469,6 @@ async def attendance_panel_error(interaction: discord.Interaction, error: app_co
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
             "勤怠パネルの設置にはサーバー管理権限が必要です。", ephemeral=True
-        )
-        return
-    raise error
-
-
-@attendance_daily.error
-async def attendance_daily_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message(
-            "勤怠日別の表示にはサーバー管理権限が必要です。", ephemeral=True
         )
         return
     raise error
