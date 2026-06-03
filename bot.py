@@ -291,11 +291,26 @@ def session_text(session: sqlite3.Row) -> str:
     )
 
 
+def session_status_embed(title: str, message: str, session: sqlite3.Row) -> discord.Embed:
+    is_working = session["clock_out"] is None
+    status = "🟢 出勤中" if is_working else "🔵 退勤済み"
+    color = discord.Color.green() if is_working else discord.Color.blue()
+    embed = discord.Embed(title=title, description=message, color=color)
+    embed.add_field(name="状態", value=status, inline=False)
+    embed.add_field(name="記録ID", value=f"`#{session['id']}`")
+    embed.add_field(name="出勤", value=f"🟢 `{format_datetime(session['clock_in'])}`")
+    embed.add_field(name="退勤", value=f"🔴 `{format_datetime(session['clock_out'])}`")
+    return embed
+
+
 def attendance_embed(message: str | None = None) -> discord.Embed:
-    description = "ボタンから出勤・退勤を記録できます。修正内容は履歴として保存されます。"
+    description = (
+        "🟢 出勤、🔴 退勤、📝 修正をボタンで記録できます。\n"
+        "押した後は本人だけに現在の状態が表示されます。"
+    )
     if message:
         description = f"{message}\n\n{description}"
-    return discord.Embed(title="勤怠管理", description=description, color=discord.Color.blue())
+    return discord.Embed(title="🕒 勤怠管理", description=description, color=discord.Color.blue())
 
 
 def attendance_list_embed() -> discord.Embed:
@@ -428,8 +443,10 @@ class CorrectionModal(discord.ui.Modal, title="勤怠記録の修正"):
             )
             await send_audit_log(interaction, audit)
             await interaction.response.send_message(
-                embed=attendance_embed(
-                    f"修正しました。修正履歴にも記録済みです。\n{session_text(session)}"
+                embed=session_status_embed(
+                    "📝 勤怠を修正しました",
+                    "修正履歴にも記録済みです。",
+                    session,
                 ),
                 view=AttendanceView(),
                 ephemeral=True,
@@ -461,38 +478,46 @@ class AttendanceView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="出勤", style=discord.ButtonStyle.success, custom_id="attendance:clock_in")
+    @discord.ui.button(label="🟢 出勤", style=discord.ButtonStyle.success, custom_id="attendance:clock_in")
     async def clock_in(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         assert interaction.guild_id
         try:
             session = await db.clock_in(interaction.guild_id, interaction.user.id)
             await interaction.response.send_message(
-                embed=attendance_embed(f"出勤を記録しました。\n{session_text(session)}"),
+                embed=session_status_embed(
+                    "🟢 出勤しました",
+                    "現在は出勤中です。退勤するときは `🔴 退勤` を押してください。",
+                    session,
+                ),
                 view=AttendanceView(),
                 ephemeral=True,
             )
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
 
-    @discord.ui.button(label="退勤", style=discord.ButtonStyle.danger, custom_id="attendance:clock_out")
+    @discord.ui.button(label="🔴 退勤", style=discord.ButtonStyle.danger, custom_id="attendance:clock_out")
     async def clock_out(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         assert interaction.guild_id
         try:
             session = await db.clock_out(interaction.guild_id, interaction.user.id)
             await interaction.response.send_message(
-                embed=attendance_embed(f"退勤を記録しました。\n{session_text(session)}"),
+                embed=session_status_embed(
+                    "🔴 退勤しました",
+                    "お疲れさまでした。退勤済みとして記録されています。",
+                    session,
+                ),
                 view=AttendanceView(),
                 ephemeral=True,
             )
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
 
-    @discord.ui.button(label="修正", style=discord.ButtonStyle.secondary, custom_id="attendance:correct")
+    @discord.ui.button(label="📝 修正", style=discord.ButtonStyle.secondary, custom_id="attendance:correct")
     async def correct(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         assert interaction.guild_id
         session = db.latest_session(interaction.guild_id, interaction.user.id)
         if not session:
-            await interaction.response.send_message("修正できる勤怠記録がありません。", ephemeral=True)
+            await interaction.response.send_message("⚪ 修正できる勤怠記録がありません。", ephemeral=True)
             return
         await interaction.response.send_modal(CorrectionModal(session))
 
