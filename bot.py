@@ -283,6 +283,22 @@ def chunk_lines(lines: list[str], limit: int = 1900) -> list[str]:
     return chunks
 
 
+def monthly_attendance_chunks(guild_id: int, user_id: int, month_start: datetime) -> list[str]:
+    sessions = db.list_sessions(guild_id, user_id, month_start)
+    label = month_start.strftime("%Y-%m")
+    if not sessions:
+        return [f"{label} の勤怠記録はありません。"]
+
+    lines = [f"**{label} の勤怠一覧**"]
+    for session in sessions:
+        corrected = " 修正済み" if session["corrected"] else ""
+        lines.append(
+            f"`#{session['id']}` {format_datetime(session['clock_in'])} - "
+            f"{format_datetime(session['clock_out'])}{corrected}"
+        )
+    return chunk_lines(lines)
+
+
 async def send_audit_log(interaction: discord.Interaction, audit: sqlite3.Row) -> None:
     if not AUDIT_CHANNEL_ID:
         return
@@ -358,6 +374,28 @@ class CorrectionModal(discord.ui.Modal, title="勤怠記録の修正"):
             await interaction.response.send_message(str(exc), ephemeral=True)
 
 
+class AttendanceListModal(discord.ui.Modal, title="勤怠一覧"):
+    month = discord.ui.TextInput(
+        label="表示する月",
+        placeholder="YYYY-MM。空欄なら当月",
+        required=False,
+        max_length=7,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id
+        try:
+            month_start = parse_jst_month(self.month.value)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        chunks = monthly_attendance_chunks(interaction.guild_id, interaction.user.id, month_start)
+        await interaction.response.send_message(chunks[0], ephemeral=True)
+        for chunk in chunks[1:]:
+            await interaction.followup.send(chunk, ephemeral=True)
+
+
 class AttendanceView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
@@ -397,6 +435,10 @@ class AttendanceView(discord.ui.View):
             return
         await interaction.response.send_modal(CorrectionModal(session))
 
+    @discord.ui.button(label="勤怠一覧", style=discord.ButtonStyle.primary, custom_id="attendance:list")
+    async def list_attendance(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(AttendanceListModal())
+
 
 class AttendanceBot(commands.Bot):
     def __init__(self) -> None:
@@ -429,20 +471,7 @@ async def attendance_list(interaction: discord.Interaction, 月: str | None = No
         await interaction.response.send_message(str(exc), ephemeral=True)
         return
 
-    sessions = db.list_sessions(interaction.guild_id, interaction.user.id, month_start)
-    label = month_start.strftime("%Y-%m")
-    if not sessions:
-        await interaction.response.send_message(f"{label} の勤怠記録はありません。", ephemeral=True)
-        return
-    lines = [f"**{label} の勤怠一覧**"]
-    for session in sessions:
-        corrected = " 修正済み" if session["corrected"] else ""
-        lines.append(
-            f"`#{session['id']}` {format_datetime(session['clock_in'])} - "
-            f"{format_datetime(session['clock_out'])}{corrected}"
-        )
-
-    chunks = chunk_lines(lines)
+    chunks = monthly_attendance_chunks(interaction.guild_id, interaction.user.id, month_start)
     await interaction.response.send_message(chunks[0], ephemeral=True)
     for chunk in chunks[1:]:
         await interaction.followup.send(chunk, ephemeral=True)
