@@ -268,6 +268,14 @@ def attendance_embed(message: str | None = None) -> discord.Embed:
     return discord.Embed(title="勤怠管理", description=description, color=discord.Color.blue())
 
 
+def attendance_list_embed() -> discord.Embed:
+    return discord.Embed(
+        title="勤怠一覧",
+        description="ボタンから自分の月別勤怠を確認できます。",
+        color=discord.Color.green(),
+    )
+
+
 def chunk_lines(lines: list[str], limit: int = 1900) -> list[str]:
     chunks: list[str] = []
     current = ""
@@ -435,7 +443,12 @@ class AttendanceView(discord.ui.View):
             return
         await interaction.response.send_modal(CorrectionModal(session))
 
-    @discord.ui.button(label="勤怠一覧", style=discord.ButtonStyle.primary, custom_id="attendance:list")
+
+class AttendanceListView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="勤怠一覧", style=discord.ButtonStyle.primary, custom_id="attendance_list:open")
     async def list_attendance(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(AttendanceListModal())
 
@@ -447,6 +460,7 @@ class AttendanceBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         self.add_view(AttendanceView())
+        self.add_view(AttendanceListView())
         await self.tree.sync()
 
 
@@ -458,6 +472,13 @@ bot = AttendanceBot()
 @app_commands.checks.has_permissions(manage_guild=True)
 async def attendance_panel(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=attendance_embed(), view=AttendanceView())
+
+
+@bot.tree.command(name="勤怠一覧パネル", description="勤怠一覧ボタンだけのパネルを設置します")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+async def attendance_list_panel(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(embed=attendance_list_embed(), view=AttendanceListView())
 
 
 @bot.tree.command(name="勤怠一覧", description="自分の指定月の勤怠記録を表示します")
@@ -498,6 +519,18 @@ async def attendance_panel_error(interaction: discord.Interaction, error: app_co
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message(
             "勤怠パネルの設置にはサーバー管理権限が必要です。", ephemeral=True
+        )
+        return
+    raise error
+
+
+@attendance_list_panel.error
+async def attendance_list_panel_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "勤怠一覧パネルの設置にはサーバー管理権限が必要です。", ephemeral=True
         )
         return
     raise error
