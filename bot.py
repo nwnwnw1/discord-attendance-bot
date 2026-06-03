@@ -17,6 +17,7 @@ load_dotenv()
 JST = ZoneInfo("Asia/Tokyo")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "attendance.db")
 AUDIT_CHANNEL_ID = int(os.getenv("AUDIT_CHANNEL_ID", "0"))
+ATTENDANCE_LIST_CHANNEL_ID = int(os.getenv("ATTENDANCE_LIST_CHANNEL_ID", "0"))
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("attendance-bot")
@@ -82,6 +83,11 @@ class AttendanceDatabase:
                 after_json TEXT,
                 reason TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_sessions_user
@@ -183,6 +189,23 @@ class AttendanceDatabase:
             """,
             (guild_id, user_id, limit),
         ).fetchall()
+
+    def get_setting(self, key: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT value FROM bot_settings WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO bot_settings(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        self.connection.commit()
 
     async def correct_session(
         self,
@@ -457,11 +480,54 @@ class AttendanceBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         super().__init__(command_prefix="!", intents=intents)
+        self.attendance_list_panel_ready = False
 
     async def setup_hook(self) -> None:
         self.add_view(AttendanceView())
         self.add_view(AttendanceListView())
         await self.tree.sync()
+
+    async def on_ready(self) -> None:
+        if self.attendance_list_panel_ready:
+            return
+        self.attendance_list_panel_ready = True
+        await self.ensure_attendance_list_panel()
+
+    async def ensure_attendance_list_panel(self) -> None:
+        if not ATTENDANCE_LIST_CHANNEL_ID:
+            return
+
+        channel = self.get_channel(ATTENDANCE_LIST_CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(ATTENDANCE_LIST_CHANNEL_ID)
+            except discord.HTTPException:
+                log.exception("Failed to fetch ATTENDANCE_LIST_CHANNEL_ID")
+                return
+
+        if not isinstance(channel, discord.TextChannel):
+            log.warning("ATTENDANCE_LIST_CHANNEL_ID does not point to a text channel")
+            return
+
+        setting_key = f"attendance_list_panel_message_id:{ATTENDANCE_LIST_CHANNEL_ID}"
+        saved_message_id = db.get_setting(setting_key)
+        if saved_message_id:
+            try:
+                await channel.fetch_message(int(saved_message_id))
+                return
+            except (ValueError, discord.NotFound):
+                pass
+            except discord.HTTPException:
+                log.exception("Failed to fetch the saved attendance list panel message")
+                return
+
+        try:
+            message = await channel.send(embed=attendance_list_embed(), view=AttendanceListView())
+        except discord.HTTPException:
+            log.exception("Failed to send the attendance list panel")
+            return
+        db.set_setting(setting_key, str(message.id))
+        log.info("Attendance list panel installed in channel %s", ATTENDANCE_LIST_CHANNEL_ID)
 
 
 bot = AttendanceBot()
