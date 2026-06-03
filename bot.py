@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sqlite3
+from calendar import monthrange
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -31,6 +32,12 @@ def format_datetime(value: str | None) -> str:
     if not value:
         return "未打刻"
     return datetime.fromisoformat(value).astimezone(JST).strftime("%Y-%m-%d %H:%M")
+
+
+def format_time(value: str | None) -> str:
+    if not value:
+        return "未打刻"
+    return datetime.fromisoformat(value).astimezone(JST).strftime("%H:%M")
 
 
 def parse_jst_datetime(value: str, field_name: str) -> str | None:
@@ -317,16 +324,31 @@ def chunk_lines(lines: list[str], limit: int = 1900) -> list[str]:
 def monthly_attendance_chunks(guild_id: int, user_id: int, month_start: datetime) -> list[str]:
     sessions = db.list_sessions(guild_id, user_id, month_start)
     label = month_start.strftime("%Y-%m")
-    if not sessions:
-        return [f"{label} の勤怠記録はありません。"]
-
-    lines = [f"**{label} の勤怠一覧**"]
+    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+    sessions_by_day: dict[int, list[sqlite3.Row]] = {}
     for session in sessions:
-        corrected = " 修正済み" if session["corrected"] else ""
-        lines.append(
-            f"`#{session['id']}` {format_datetime(session['clock_in'])} - "
-            f"{format_datetime(session['clock_out'])}{corrected}"
-        )
+        day = datetime.fromisoformat(session["clock_in"]).astimezone(JST).day
+        sessions_by_day.setdefault(day, []).append(session)
+
+    lines = [f"**📅 {label} の勤怠一覧**"]
+    _, last_day = monthrange(month_start.year, month_start.month)
+    for day in range(1, last_day + 1):
+        day_value = month_start.replace(day=day)
+        weekday = weekdays[day_value.weekday()]
+        day_label = f"{month_start.month:02}/{day:02}({weekday})"
+        day_sessions = sessions_by_day.get(day, [])
+        if not day_sessions:
+            lines.append(f"`{day_label}` ⚪ 勤怠なし")
+            continue
+
+        for index, session in enumerate(day_sessions):
+            corrected = " 📝修正済み" if session["corrected"] else ""
+            prefix = f"`{day_label}`" if index == 0 else "`          `"
+            lines.append(
+                f"{prefix} 🟢出勤 `{format_time(session['clock_in'])}` / "
+                f"🔴退勤 `{format_time(session['clock_out'])}` "
+                f"`#{session['id']}`{corrected}"
+            )
     return chunk_lines(lines)
 
 
