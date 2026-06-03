@@ -9,6 +9,7 @@ Discordのボタンから出勤・退勤を記録し、本人が勤怠を修正�
 - `退勤` ボタン: 出勤中の記録に現在時刻を記録
 - `修正` ボタン: 自分の直近の記録をフォームで修正
 - `/勤怠一覧`: 自分の直近10件を表示。修正済みの記録も判別可能
+- `/勤怠日別`: 管理権限を持つ人が指定日の出勤・退勤時刻をチャンネルに一覧表示
 - `/修正履歴`: 自分の直近10件の修正履歴を表示
 - `/勤怠パネル`: 管理権限を持つ人が操作パネルを設置
 
@@ -19,34 +20,40 @@ Discordのボタンから出勤・退勤を記録し、本人が勤怠を修正�
 1. Discord Developer PortalでBotを作成します。
 2. OAuth2 URL Generatorで `bot` と `applications.commands` を選び、Botをサーバーへ招待します。
 3. Bot Permissionsには最低限 `View Channels`、`Send Messages`、`Embed Links` を付与します。
-4. Raspberry Pi OS上でこのリポジトリを取得し、依存関係をインストールします。
+4. Raspberry Pi OS上でこのリポジトリを取得します。
 
 ```bash
 sudo apt update
 sudo apt install -y git python3 python3-venv
-git clone git@github.com:nwnwnw1/discord-attendance-bot.git
+git clone https://github.com/nwnwnw1/discord-attendance-bot.git
 cd discord-attendance-bot
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 cp .env.example .env
 nano .env
 ```
 
 5. `.env` の `DISCORD_TOKEN` と `AUDIT_CHANNEL_ID` を設定します。
-6. Botを起動します。
+6. セットアップスクリプトを実行します。
 
 ```bash
-python3 bot.py
+chmod +x scripts/install-raspberry-pi.sh
+sudo ./scripts/install-raspberry-pi.sh
 ```
+
+このスクリプトは `.venv` の作成、依存関係のインストール、systemdサービスの登録、有効化を行います。
 
 7. Discordで `/勤怠パネル` を一度実行します。
 
+手動で起動する場合は次のコマンドを使います。
+
+```bash
+.venv/bin/python bot.py
+```
+
 ## Raspberry Piで自動起動
 
-Privateリポジトリを取得するため、事前にRaspberry PiのSSH公開鍵をGitHubへ登録してください。
+`scripts/install-raspberry-pi.sh` は `/etc/systemd/system/discord-attendance.service` を自動作成します。
 
-`discord-attendance.service.example` を参考に `/etc/systemd/system/discord-attendance.service` を作成します。
+手動で作成する場合は、`discord-attendance.service.example` を参考に `/etc/systemd/system/discord-attendance.service` を作成します。
 `YOUR_USER` と `/home/YOUR_USER/discord-attendance-bot` は実際のユーザー名と配置先に置き換えてください。
 
 ```ini
@@ -59,6 +66,7 @@ Wants=network-online.target
 Type=simple
 User=YOUR_USER
 WorkingDirectory=/home/YOUR_USER/discord-attendance-bot
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/YOUR_USER/discord-attendance-bot/.venv/bin/python bot.py
 Restart=always
 RestartSec=5
@@ -75,9 +83,38 @@ sudo systemctl enable --now discord-attendance
 sudo systemctl status discord-attendance
 ```
 
+ログを確認します。
+
+```bash
+journalctl -u discord-attendance -f
+```
+
+Botを更新する場合は、リポジトリをpullして依存関係を更新してからサービスを再起動します。
+
+```bash
+cd /home/YOUR_USER/discord-attendance-bot
+git pull
+source .venv/bin/activate
+pip install -r requirements.txt
+sudo systemctl restart discord-attendance
+```
+
+勤怠データは `attendance.db` に保存されます。バックアップする場合はBotを止めてからコピーしてください。
+
+```bash
+sudo systemctl stop discord-attendance
+cp attendance.db attendance.db.backup
+sudo systemctl start discord-attendance
+```
+
 ## 修正の扱い
 
 `修正` ボタンを押すと直近の記録が初期値として表示されます。
 過去の記録を直す場合は `/勤怠一覧` で確認した記録IDへ書き換えてください。
 
 時刻は `YYYY-MM-DD HH:MM` 形式で入力します。未退勤へ戻す場合、退勤時刻には `-` を入力します。
+
+## 日付別一覧
+
+管理権限を持つ人は `/勤怠日別` で指定日の勤怠をチャンネルに表示できます。
+日付は `YYYY-MM-DD` 形式で指定します。日付を省略した場合は今日の一覧を表示します。

@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=YOUR_USER
 WorkingDirectory=/home/YOUR_USER/discord-attendance-bot
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/YOUR_USER/discord-attendance-bot/.venv/bin/python bot.py
 Restart=always
 RestartSec=5
