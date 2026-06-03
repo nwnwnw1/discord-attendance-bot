@@ -4,7 +4,7 @@ import logging
 import os
 import sqlite3
 from calendar import monthrange
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import discord
@@ -40,6 +40,14 @@ def format_time(value: str | None) -> str:
     return datetime.fromisoformat(value).astimezone(JST).strftime("%H:%M")
 
 
+def format_clock_out_label(session: sqlite3.Row) -> str:
+    if session["clock_out"]:
+        return f"🔴退勤 `{format_time(session['clock_out'])}`"
+    if session["missing_clock_out"]:
+        return "⚠️退勤 `未打刻`"
+    return "🔴退勤 `未打刻`"
+
+
 def parse_jst_datetime(value: str, field_name: str) -> str | None:
     value = value.strip()
     if not value or value == "-":
@@ -60,6 +68,12 @@ def parse_jst_month(value: str | None) -> datetime:
         raise ValueError("月は `YYYY-MM` 形式で入力してください。") from exc
 
 
+def stale_clock_out_cutoff(clock_in: str) -> datetime:
+    clock_in_jst = datetime.fromisoformat(clock_in).astimezone(JST)
+    next_day = clock_in_jst.date() + timedelta(days=1)
+    return datetime(next_day.year, next_day.month, next_day.day, 5, 0, tzinfo=JST)
+
+
 class AttendanceDatabase:
     def __init__(self, path: str) -> None:
         self.connection = sqlite3.connect(path)
@@ -76,6 +90,7 @@ class AttendanceDatabase:
                 user_id INTEGER NOT NULL,
                 clock_in TEXT NOT NULL,
                 clock_out TEXT,
+                missing_clock_out INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -103,14 +118,23 @@ class AttendanceDatabase:
                 ON attendance_audits(guild_id, session_id, id DESC);
             """
         )
+        columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(work_sessions)").fetchall()
+        }
+        if "missing_clock_out" not in columns:
+            self.connection.execute(
+                "ALTER TABLE work_sessions ADD COLUMN missing_clock_out INTEGER NOT NULL DEFAULT 0"
+            )
         self.connection.commit()
 
-    async def clock_in(self, guild_id: int, user_id: int) -> sqlite3.Row:
+    async def clock_in(self, guild_id: int, user_id: int) -> tuple[sqlite3.Row, list[sqlite3.Row]]:
         async with self.lock:
+            stale_sessions = self.mark_stale_open_sessions(guild_id, user_id)
             open_session = self.connection.execute(
                 """
                 SELECT * FROM work_sessions
-                WHERE guild_id = ? AND user_id = ? AND clock_out IS NULL
+                WHERE guild_id = ? AND user_id = ? AND clock_out IS NULL AND missing_clock_out = 0
                 ORDER BY id DESC LIMIT 1
                 """,
                 (guild_id, user_id),
@@ -127,14 +151,15 @@ class AttendanceDatabase:
                 (guild_id, user_id, now, now, now),
             )
             self.connection.commit()
-            return self.get_session(cursor.lastrowid)
+            return self.get_session(cursor.lastrowid), stale_sessions
 
     async def clock_out(self, guild_id: int, user_id: int) -> sqlite3.Row:
         async with self.lock:
+            self.mark_stale_open_sessions(guild_id, user_id)
             session = self.connection.execute(
                 """
                 SELECT * FROM work_sessions
-                WHERE guild_id = ? AND user_id = ? AND clock_out IS NULL
+                WHERE guild_id = ? AND user_id = ? AND clock_out IS NULL AND missing_clock_out = 0
                 ORDER BY id DESC LIMIT 1
                 """,
                 (guild_id, user_id),
@@ -149,6 +174,30 @@ class AttendanceDatabase:
             )
             self.connection.commit()
             return self.get_session(session["id"])
+
+    def mark_stale_open_sessions(self, guild_id: int, user_id: int) -> list[sqlite3.Row]:
+        now_jst = datetime.now(JST)
+        open_sessions = self.connection.execute(
+            """
+            SELECT * FROM work_sessions
+            WHERE guild_id = ? AND user_id = ? AND clock_out IS NULL AND missing_clock_out = 0
+            ORDER BY id ASC
+            """,
+            (guild_id, user_id),
+        ).fetchall()
+        stale_sessions = [
+            session for session in open_sessions if now_jst >= stale_clock_out_cutoff(session["clock_in"])
+        ]
+        if not stale_sessions:
+            return []
+
+        now = utc_now()
+        self.connection.executemany(
+            "UPDATE work_sessions SET missing_clock_out = 1, updated_at = ? WHERE id = ?",
+            [(now, session["id"]) for session in stale_sessions],
+        )
+        self.connection.commit()
+        return stale_sessions
 
     def get_session(self, session_id: int) -> sqlite3.Row | None:
         return self.connection.execute(
@@ -166,6 +215,7 @@ class AttendanceDatabase:
         ).fetchone()
 
     def list_sessions(self, guild_id: int, user_id: int, month_start: datetime) -> list[sqlite3.Row]:
+        self.mark_stale_open_sessions(guild_id, user_id)
         if month_start.month == 12:
             next_month = month_start.replace(year=month_start.year + 1, month=1)
         else:
@@ -234,7 +284,8 @@ class AttendanceDatabase:
                 other_open_session = self.connection.execute(
                     """
                     SELECT id FROM work_sessions
-                    WHERE guild_id = ? AND user_id = ? AND clock_out IS NULL AND id != ?
+                    WHERE guild_id = ? AND user_id = ? AND clock_out IS NULL
+                      AND missing_clock_out = 0 AND id != ?
                     LIMIT 1
                     """,
                     (guild_id, owner_id, session_id),
@@ -249,7 +300,7 @@ class AttendanceDatabase:
             self.connection.execute(
                 """
                 UPDATE work_sessions
-                SET clock_in = ?, clock_out = ?, updated_at = ?
+                SET clock_in = ?, clock_out = ?, missing_clock_out = 0, updated_at = ?
                 WHERE id = ?
                 """,
                 (clock_in, clock_out, now, session_id),
@@ -292,14 +343,15 @@ def session_text(session: sqlite3.Row) -> str:
 
 
 def session_status_embed(title: str, message: str, session: sqlite3.Row) -> discord.Embed:
-    is_working = session["clock_out"] is None
-    status = "🟢 出勤中" if is_working else "🔵 退勤済み"
-    color = discord.Color.green() if is_working else discord.Color.blue()
+    is_missing = bool(session["missing_clock_out"])
+    is_working = session["clock_out"] is None and not is_missing
+    status = "⚠️ 退勤未打刻" if is_missing else "🟢 出勤中" if is_working else "🔵 退勤済み"
+    color = discord.Color.orange() if is_missing else discord.Color.green() if is_working else discord.Color.blue()
     embed = discord.Embed(title=title, description=message, color=color)
     embed.add_field(name="状態", value=status, inline=False)
     embed.add_field(name="記録ID", value=f"`#{session['id']}`")
     embed.add_field(name="出勤", value=f"🟢 `{format_datetime(session['clock_in'])}`")
-    embed.add_field(name="退勤", value=f"🔴 `{format_datetime(session['clock_out'])}`")
+    embed.add_field(name="退勤", value=format_clock_out_label(session))
     return embed
 
 
@@ -361,7 +413,7 @@ def monthly_attendance_chunks(guild_id: int, user_id: int, month_start: datetime
             prefix = f"`{day_label}`" if index == 0 else "`          `"
             lines.append(
                 f"{prefix} 🟢出勤 `{format_time(session['clock_in'])}` / "
-                f"🔴退勤 `{format_time(session['clock_out'])}` "
+                f"{format_clock_out_label(session)} "
                 f"`#{session['id']}`{corrected}"
             )
     return chunk_lines(lines)
@@ -482,11 +534,18 @@ class AttendanceView(discord.ui.View):
     async def clock_in(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         assert interaction.guild_id
         try:
-            session = await db.clock_in(interaction.guild_id, interaction.user.id)
+            session, stale_sessions = await db.clock_in(interaction.guild_id, interaction.user.id)
+            message = "現在は出勤中です。退勤するときは `🔴 退勤` を押してください。"
+            if stale_sessions:
+                stale_ids = ", ".join(f"`#{stale['id']}`" for stale in stale_sessions)
+                message = (
+                    f"前回の退勤忘れを未打刻として扱いました: {stale_ids}\n"
+                    "新しい出勤を記録しました。退勤するときは `🔴 退勤` を押してください。"
+                )
             await interaction.response.send_message(
                 embed=session_status_embed(
                     "🟢 出勤しました",
-                    "現在は出勤中です。退勤するときは `🔴 退勤` を押してください。",
+                    message,
                     session,
                 ),
                 view=AttendanceView(),
