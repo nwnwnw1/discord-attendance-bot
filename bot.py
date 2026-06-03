@@ -530,7 +530,7 @@ class AttendanceView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="🟢 出勤", style=discord.ButtonStyle.success, custom_id="attendance:clock_in")
+    @discord.ui.button(label="出勤", style=discord.ButtonStyle.success, custom_id="attendance:clock_in")
     async def clock_in(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         assert interaction.guild_id
         try:
@@ -554,7 +554,7 @@ class AttendanceView(discord.ui.View):
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
 
-    @discord.ui.button(label="🔴 退勤", style=discord.ButtonStyle.danger, custom_id="attendance:clock_out")
+    @discord.ui.button(label="退勤", style=discord.ButtonStyle.danger, custom_id="attendance:clock_out")
     async def clock_out(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         assert interaction.guild_id
         try:
