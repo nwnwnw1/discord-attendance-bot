@@ -335,15 +335,17 @@ def monthly_attendance_chunks(guild_id: int, user_id: int, month_start: datetime
     for day in range(1, last_day + 1):
         day_value = month_start.replace(day=day)
         weekday = weekdays[day_value.weekday()]
+        weekend_marker = "🔵" if day_value.weekday() == 5 else "🔴" if day_value.weekday() == 6 else ""
+        marker_prefix = f"{weekend_marker} " if weekend_marker else ""
         day_label = f"{month_start.month:02}/{day:02}({weekday})"
         day_sessions = sessions_by_day.get(day, [])
         if not day_sessions:
-            lines.append(f"`{day_label}` ⚪ 勤怠なし")
+            lines.append(f"{marker_prefix}`{day_label}` ⚪ 勤怠なし")
             continue
 
         for index, session in enumerate(day_sessions):
             corrected = " 📝修正済み" if session["corrected"] else ""
-            prefix = f"`{day_label}`" if index == 0 else "`          `"
+            prefix = f"{marker_prefix}`{day_label}`" if index == 0 else "`          `"
             lines.append(
                 f"{prefix} 🟢出勤 `{format_time(session['clock_in'])}` / "
                 f"🔴退勤 `{format_time(session['clock_out'])}` "
