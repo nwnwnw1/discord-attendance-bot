@@ -153,7 +153,7 @@ class AttendanceDatabase:
             self.connection.commit()
             return self.get_session(cursor.lastrowid), stale_sessions
 
-    async def clock_out(self, guild_id: int, user_id: int) -> sqlite3.Row:
+    async def clock_out(self, guild_id: int, user_id: int) -> tuple[sqlite3.Row, bool]:
         async with self.lock:
             self.mark_stale_open_sessions(guild_id, user_id)
             session = self.connection.execute(
@@ -164,8 +164,18 @@ class AttendanceDatabase:
                 """,
                 (guild_id, user_id),
             ).fetchone()
+            is_update = False
             if not session:
-                raise ValueError("出勤中の記録がありません。")
+                session = self.latest_session(guild_id, user_id)
+                if not session:
+                    raise ValueError("出勤中の記録がありません。")
+                if session["missing_clock_out"]:
+                    raise ValueError("前回の記録は退勤未打刻扱いです。修正ボタンから直してください。")
+                if not session["clock_out"]:
+                    raise ValueError("出勤中の記録がありません。")
+                if datetime.now(JST) >= stale_clock_out_cutoff(session["clock_in"]):
+                    raise ValueError("前回の勤務日は締め切り済みです。修正ボタンから直してください。")
+                is_update = True
 
             now = utc_now()
             self.connection.execute(
@@ -173,7 +183,7 @@ class AttendanceDatabase:
                 (now, now, session["id"]),
             )
             self.connection.commit()
-            return self.get_session(session["id"])
+            return self.get_session(session["id"]), is_update
 
     def mark_stale_open_sessions(self, guild_id: int, user_id: int) -> list[sqlite3.Row]:
         now_jst = datetime.now(JST)
@@ -558,11 +568,17 @@ class AttendanceView(discord.ui.View):
     async def clock_out(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         assert interaction.guild_id
         try:
-            session = await db.clock_out(interaction.guild_id, interaction.user.id)
+            session, is_update = await db.clock_out(interaction.guild_id, interaction.user.id)
+            title = "🔴 退勤時刻を更新しました" if is_update else "🔴 退勤しました"
+            message = (
+                "後から押された退勤時刻で記録を更新しました。"
+                if is_update
+                else "お疲れさまでした。退勤済みとして記録されています。"
+            )
             await interaction.response.send_message(
                 embed=session_status_embed(
-                    "🔴 退勤しました",
-                    "お疲れさまでした。退勤済みとして記録されています。",
+                    title,
+                    message,
                     session,
                 ),
                 view=AttendanceView(),
